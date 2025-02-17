@@ -14,6 +14,7 @@ import (
 type IoTClient struct {
 	cfg        *config.Environment
 	MqttClient mqtt.Client
+	jobHandler *JobHandler
 }
 
 func NewIoTClient(cfg *config.Environment) (*IoTClient, error) {
@@ -22,8 +23,9 @@ func NewIoTClient(cfg *config.Environment) (*IoTClient, error) {
 		cfg.CertPath,
 		cfg.KeyPath,
 	)
+
 	certpool := x509.NewCertPool()
-	pemCert, err := os.ReadFile(cfg.RootCAPath) // Changed from CertPath to RootCAPath
+	pemCert, err := os.ReadFile(cfg.RootCAPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read root CA: %w", err)
 	}
@@ -48,13 +50,14 @@ func NewIoTClient(cfg *config.Environment) (*IoTClient, error) {
 	opts.SetKeepAlive(30 * time.Second)
 	opts.SetAutoReconnect(true)
 
-	// Create closure to capture cfg
-	thingName := cfg.ThingName
+	client := mqtt.NewClient(opts)
+	jobHandler := NewJobHandler(cfg.ThingName, nil) // Temporarily pass nil
+
 	opts.OnConnect = func(client mqtt.Client) {
 		log.Println("Connected to AWS IoT Core")
-		topic := fmt.Sprintf("$aws/things/%s/jobs/#", thingName)
+		topic := fmt.Sprintf("$aws/things/%s/jobs/#", cfg.ThingName)
 		log.Printf("Subscribing to %s", topic)
-		if token := client.Subscribe(topic, 1, messageHandler); token.Wait() && token.Error() != nil {
+		if token := client.Subscribe(topic, 1, jobHandler.HandleMessage); token.Wait() && token.Error() != nil {
 			log.Printf("Error subscribing to topic: %v", token.Error())
 		}
 	}
@@ -63,7 +66,11 @@ func NewIoTClient(cfg *config.Environment) (*IoTClient, error) {
 		log.Printf("Connection lost: %v", err)
 	}
 
-	client := mqtt.NewClient(opts)
+	// Create client with finalized options
+	client = mqtt.NewClient(opts)
+	// Update jobHandler with the actual client
+	jobHandler.mqttClient = client
+
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
 		return nil, fmt.Errorf("failed to connect: %w", token.Error())
 	}
@@ -71,16 +78,8 @@ func NewIoTClient(cfg *config.Environment) (*IoTClient, error) {
 	return &IoTClient{
 		cfg:        cfg,
 		MqttClient: client,
+		jobHandler: jobHandler,
 	}, nil
-}
-
-func messageHandler(client mqtt.Client, msg mqtt.Message) {
-	log.Printf("Received message on topic: %s", msg.Topic())
-	log.Printf("Message ID: %d", msg.MessageID())
-	log.Printf("Payload: %s", string(msg.Payload()))
-
-	// Add message acknowledgement for QoS 1
-	msg.Ack()
 }
 
 func (c *IoTClient) Close() {
